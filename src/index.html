@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>BOM 对比工具</title>
+<style>
+  body { font-family: "Microsoft YaHei", Arial, sans-serif; margin: 30px; background: #f5f6f8; }
+  h1 { font-size: 20px; }
+  .box { background: #fff; padding: 20px; border-radius: 8px; margin-bottom: 16px; box-shadow: 0 1px 4px rgba(0,0,0,.08); }
+  label { display: inline-block; width: 100px; }
+  button { padding: 8px 18px; background: #1677ff; color: #fff; border: none; border-radius: 6px; cursor: pointer; font-size: 14px; }
+  button:disabled { background: #aaa; cursor: not-allowed; }
+  .tip { color: #666; font-size: 13px; margin-top: 8px; line-height: 1.6; }
+  #log { margin-top: 12px; font-size: 13px; color: #333; white-space: pre-wrap; }
+  table { border-collapse: collapse; width: 100%; font-size: 12px; margin-top: 10px; }
+  th, td { border: 1px solid #ddd; padding: 4px 6px; text-align: left; vertical-align: top; }
+  th { background: #e0f2f1; position: sticky; top: 0; }
+  .scroll { max-height: 420px; overflow: auto; }
+  td.action { white-space: pre-line; }
+</style>
+</head>
+<body>
+
+<h1>BOM 对比工具</h1>
+
+<div class="box">
+  <div><label>实物文件：</label><input type="file" id="fileA" accept=".xlsx,.xls"></div>
+  <div style="margin-top:8px"><label>需求文件：</label><input type="file" id="fileB" accept=".xlsx,.xls"></div>
+  <div class="tip">
+    只对比 part_number / quantity / reference。<br>
+    用量相同、位号相同 → 不展示，不导出。
+  </div>
+</div>
+
+<div class="box">
+  <button id="btnRun" disabled>开始对比</button>
+  <button id="btnExport" disabled>导出改制清单</button>
+  <div id="log"></div>
+</div>
+
+<div class="box">
+  <div class="scroll">
+    <table id="resultTable">
+      <thead>
+        <tr>
+          <th>料号</th>
+          <th>用量</th>
+          <th>实物位号</th>
+          <th>需求位号</th>
+          <th>描述</th>
+          <th>动作</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </div>
+</div>
+
+<script src="xlsx.full.min.js"></script>
+
+<script>
+const state = { rowsA: [], rowsB: [], result: [] };
+
+/* ---------- 表头识别 ---------- */
+const FIELD_PATTERNS = {
+  part_number:     ['part_number', 'part number', 'partno', 'pn', 'p/n',
+                    '料号', '物料料号', '物料编码', '料件号', '零件号', '物料'],
+  quantity:        ['quantity', 'qty', '用量', '数量', '单机用量'],
+  reference:       ['reference', 'ref', 'refdes', '位号', '位置', '参考位号', '元件位号'],
+  description:     ['description', 'desc', '描述', '物料描述', '规格', '规格描述', '名称'],
+  manufacturer:    ['manufacturer', 'mfr', '制造商', '品牌', '厂商', '生产厂家'],
+  mfr_part_number: ['mfr_part_number', 'mfr part number', 'mpn',
+                    '制造商料号', '厂家料号', '原厂料号', '厂商料号']
+};
+
+function matchField(key) {
+  const k = String(key).trim().toLowerCase().replace(/\s+/g, ' ');
+  for (const std in FIELD_PATTERNS) {
+    for (const p of FIELD_PATTERNS[std]) {
+      if (k === p.toLowerCase()) return std;
+    }
+  }
+  for (const std in FIELD_PATTERNS) {
+    for (const p of FIELD_PATTERNS[std]) {
+      if (k.includes(p.toLowerCase())) return std;
+    }
+  }
+  return null;
+}
+
+function parseSheet(wb, sheetName) {
+  const ws = wb.Sheets[sheetName];
+  const aoa = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
+
+  let headerRowIdx = -1;
+  let headerMap = {};
+
+  const scanLimit = Math.min(aoa.length, 10);
+  for (let i = 0; i < scanLimit; i++) {
+    const row = aoa[i] || [];
+    const map = {};
+    row.forEach((cell, colIdx) => {
+      const std = matchField(cell);
+      if (std) map[colIdx] = std;
+    });
+    const hasKey = Object.values(map).includes('part_number');
+    const hasQty = Object.values(map).includes('quantity');
+    const hasRef = Object.values(map).includes('reference');
+    if (hasKey && (hasQty || hasRef)) {
+      headerRowIdx = i;
+      headerMap = map;
+      break;
+    }
+  }
+
+  if (headerRowIdx === -1) {
+    return { header: null, rows: [], rawHeader: aoa[0] || [] };
+  }
+
+  const rawHeader = aoa[headerRowIdx];
+  const rows = [];
+  for (let i = headerRowIdx + 1; i < aoa.length; i++) {
+    const r = aoa[i] || [];
+    const obj = {};
+    for (const colIdx in headerMap) {
+      obj[headerMap[colIdx]] = r[colIdx] !== undefined ? r[colIdx] : '';
+    }
+    ['part_number','quantity','reference','description','manufacturer','mfr_part_number']
+      .forEach(f => { if (obj[f] === undefined) obj[f] = ''; });
+    rows.push(obj);
+  }
+
+  return { header: headerMap, rows, rawHeader };
+}
+
+/* ---------- 工具 ---------- */
+function readWorkbook(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = e => {
+      try { resolve(XLSX.read(new Uint8Array(e.target.result), { type: 'array' })); }
+      catch (err) { reject(err); }
+    };
+    reader.onerror = reject;
+    reader.readAsArrayBuffer(file);
+  });
+}
+
+function guessSheet(wb) {
+  const keywords = ['sku', '实物', '需求', 'bom', 'smt', 'assembly', 'pcb', 'main', 'mb'];
+  const names = wb.SheetNames;
+  for (const k of keywords) {
+    for (const n of names) {
+      if (n.toLowerCase().includes(k)) return n;
+    }
+  }
+  return names[0];
+}
+
+function xlookup(rows, key, field) {
+  for (const r of rows) {
+    if (String(r.part_number).trim() === String(key).trim()) {
+      const v = r[field];
+      if (v === '' || v === null || v === undefined || Number(v) === 0) return 0;
+      return v;
+    }
+  }
+  return '无';
+}
+
+function exists(rows, key) {
+  for (const r of rows) {
+    if (String(r.part_number).trim() === String(key).trim()) return true;
+  }
+  return false;
+}
+
+function buildQtyText(key) {
+  const swPart = !exists(state.rowsA, key) ? '无' : xlookup(state.rowsA, key, 'quantity');
+  const xqPart = !exists(state.rowsB, key) ? '无' : xlookup(state.rowsB, key, 'quantity');
+  return '实物：' + swPart + '\n需求：' + xqPart;
+}
+
+function getRefA(key) { return xlookup(state.rowsA, key, 'reference'); }
+function getRefB(key) { return xlookup(state.rowsB, key, 'reference'); }
+
+function getDesc(key) {
+  for (const r of state.rowsB) {
+    if (String(r.part_number).trim() === String(key).trim()) {
+      return r.description === '' ? '' : r.description;
+    }
+  }
+  return '无';
+}
+
+/* ---------- 动作列：拆 / 装 ---------- */
+function splitRefs(ref) {
+  if (ref === undefined || ref === null) return [];
+  const s = String(ref).trim();
+  if (s === '' || s === '无') return [];
+  return s.split(/[,，\s]+/).map(x => x.trim()).filter(x => x);
+}
+
+function buildAction(key) {
+  const refA = splitRefs(getRefA(key));
+  const refB = splitRefs(getRefB(key));
+
+  const setA = new Set(refA);
+  const setB = new Set(refB);
+
+  const chai = refA.filter(x => !setB.has(x));
+  const zhuang = refB.filter(x => !setA.has(x));
+
+  let line1, line2;
+
+  if (chai.length === 0 && zhuang.length === 0) {
+    line1 = '拆：无';
+    line2 = '装：无';
+  } else if (chai.length > 0 && zhuang.length > 0) {
+    line1 = '拆：' + chai.join(', ');
+    line2 = '装：' + zhuang.join(', ');
+  } else if (chai.length > 0) {
+    line1 = '拆：' + chai.join(', ');
+    line2 = '装：无';
+  } else {
+    line1 = '拆：无';
+    line2 = '装：' + zhuang.join(', ');
+  }
+
+  return line1 + '\n' + line2;
+}
+
+/* ---------- 是否相同：只看用量 + 位号 ---------- */
+function normalizeStr(v) {
+  if (v === undefined || v === null) return '';
+  let s = String(v);
+  s = s.replace(/[\s\u3000]+/g, '');
+  if (s === '无' || s === '') return '';
+  return s;
+}
+
+function isSame(row) {
+  const lines = row.qtyText.split('\n');
+  const swQty = lines[0].replace('实物：', '').trim();
+  const xqQty = lines[1].replace('需求：', '').trim();
+  if (swQty === '无' || xqQty === '无') return false;
+  if (swQty !== xqQty) return false;
+
+  if (normalizeStr(row.refA) !== normalizeStr(row.refB)) return false;
+
+  return true;
+}
+
+/* ---------- 事件 ---------- */
+function refreshBtn() {
+  document.getElementById('btnRun').disabled = !(state.rowsA.length && state.rowsB.length);
+}
+
+document.getElementById('fileA').addEventListener('change', async e => {
+  const f = e.target.files[0];
+  if (!f) return;
+  try {
+    const wb = await readWorkbook(f);
+    const sheet = guessSheet(wb);
+    const parsed = parseSheet(wb, sheet);
+    state.rowsA = parsed.rows;
+    const recognized = Object.values(parsed.header || {}).join(', ') || '无';
+    document.getElementById('log').textContent =
+      `实物文件：sheet「${sheet}」，共 ${parsed.rows.length} 行。\n` +
+      `表头：${JSON.stringify(parsed.rawHeader)}\n` +
+      `识别到列：${recognized}\n` +
+      `识别到料号：${parsed.rows.filter(r => r.part_number).length} 个。`;
+    refreshBtn();
+  } catch (err) {
+    document.getElementById('log').textContent = '实物文件读取失败：' + err.message;
+  }
+});
+
+document.getElementById('fileB').addEventListener('change', async e => {
+  const f = e.target.files[0];
+  if (!f) return;
+  try {
+    const wb = await readWorkbook(f);
+    const sheet = guessSheet(wb);
+    const parsed = parseSheet(wb, sheet);
+    state.rowsB = parsed.rows;
+    const recognized = Object.values(parsed.header || {}).join(', ') || '无';
+    document.getElementById('log').textContent =
+      `需求文件：sheet「${sheet}」，共 ${parsed.rows.length} 行。\n` +
+      `表头：${JSON.stringify(parsed.rawHeader)}\n` +
+      `识别到列：${recognized}\n` +
+      `识别到料号：${parsed.rows.filter(r => r.part_number).length} 个。`;
+    refreshBtn();
+  } catch (err) {
+    document.getElementById('log').textContent = '需求文件读取失败：' + err.message;
+  }
+});
+
+document.getElementById('btnRun').addEventListener('click', () => {
+  const seen = new Set();
+  const keys = [];
+  const push = k => {
+    k = String(k).trim();
+    if (!k) return;
+    if (!seen.has(k)) { seen.add(k); keys.push(k); }
+  };
+  state.rowsA.forEach(r => push(r.part_number));
+  state.rowsB.forEach(r => push(r.part_number));
+
+  const result = keys
+    .map(key => ({
+      key,
+      qtyText: buildQtyText(key),
+      refA: String(getRefA(key)),
+      refB: String(getRefB(key)),
+      desc: getDesc(key),
+      action: buildAction(key)
+    }))
+    .filter(r => !isSame(r));
+
+  state.result = result;
+  renderTable(result);
+  document.getElementById('btnExport').disabled = result.length === 0;
+  document.getElementById('log').textContent =
+    `对比完成，共 ${result.length} 行（已过滤相同的行）。`;
+});
+
+function renderTable(rows) {
+  const tbody = document.querySelector('#resultTable tbody');
+  tbody.innerHTML = '';
+  rows.forEach(r => {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td>${escapeHtml(r.key)}</td>
+      <td style="white-space:pre-line">${escapeHtml(r.qtyText)}</td>
+      <td>${escapeHtml(r.refA)}</td>
+      <td>${escapeHtml(r.refB)}</td>
+      <td>${escapeHtml(r.desc)}</td>
+      <td class="action">${escapeHtml(r.action)}</td>
+    `;
+    tbody.appendChild(tr);
+  });
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+document.getElementById('btnExport').addEventListener('click', () => {
+  const data = state.result.map(r => ({
+    '料号': r.key,
+    '用量': r.qtyText,
+    '实物位号': r.refA,
+    '需求位号': r.refB,
+    '描述': r.desc,
+    '动作': r.action
+  }));
+
+  const ws = XLSX.utils.json_to_sheet(data);
+  ws['!cols'] = [
+    { wch: 22 },
+    { wch: 14 },
+    { wch: 40 },
+    { wch: 40 },
+    { wch: 60 },
+    { wch: 30 }
+  ];
+
+  for (const addr in ws) {
+    if (addr[0] === '!') continue;
+    const cell = ws[addr];
+    if (cell && cell.v && String(cell.v).includes('\n')) {
+      cell.s = { alignment: { wrapText: true, vertical: 'top' } };
+    }
+  }
+
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, '改制清单');
+  XLSX.writeFile(wb, '改制清单.xlsx');
+});
+</script>
+</body>
+</html>
